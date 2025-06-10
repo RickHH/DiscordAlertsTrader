@@ -71,14 +71,20 @@ def server_formatting(message):
         message = brando_trades(message)
     elif message.channel.id in [1235324290426081423]:
         message = chis_formatting(message)
-    elif message.channel.id in [986816019295252500]:
-        message = abi_formatting(message)
     elif message.channel.id in [872226993557606440]:   
         message = mikeinvesting_trades(message)
     elif message.channel.id in [140295293546659840,815942180945920020,1188480300381110272]:
         message = jb_trades(message)
     elif message.guild.id in  [826258453391081524, 1093339706260979822,1072553858053701793, 898981804478980166, 682259216861626378]:
         message = aurora_trading_formatting(message)
+    elif message.channel.id in [986816019295252500, 981643624011956000, 1345560074373959730]:
+        message = abi_formatting(message)
+    elif message.channel.id in [986816083522637834, 972651239600971000, 1345560091075809340]:
+        message = adex_formatting(message)
+    elif message.channel.id in [910228981536653342, 1345395386654916690]:
+        message = gandalf_formatting(message)
+    elif message.channel.id in [881673466565247006, 1377443629806780457]:
+        message = buffet_formatting(message)
     else:
         message = embed_to_content(message)
     return message
@@ -91,6 +97,79 @@ def embed_to_content(message_):
         (message.content.startswith('@')and len(message.content.split())):
         if message.embeds:
             message.content = message.embeds[0].description
+    return message
+
+def abi_formatting(message_):
+    """
+    Reformat Discord message from Abi
+    $COST 3/7 950p 2.12
+    """
+    message = MessageCopy(message_)
+    alert = message.content
+
+    pattern = r'\$([A-Z]+)\s+(\d{1,2}/\d{1,2})\s+(\d+)([cCpP])\s+([\d.]+)'
+    match = re.search(pattern, alert, re.IGNORECASE)
+
+    if match:
+        ticker, exp_date, strike, otype, price = match.groups()
+        # formatted_alert = f"BTO {ticker.upper()} {strike}{otype.upper()} {exp_date} @{price}"
+        formatted_alert = f"BTO {ticker.upper()} {strike}{otype.upper()} {exp_date} @{str(round(float(price)*0.87,2))}"
+        message.content = formatted_alert
+
+    return message
+
+def buffet_formatting(message_):
+    """
+    Reformat Discore message from buffet
+    5/30 $XYZ 65c @0.31
+    """
+    message = MessageCopy(message_)
+    alert = message.content
+
+    pattern = r'(\d{1,2}/\d{1,2})\s+\$([A-Z]+)\s+(\d+)([cCpP])\s+@([\d.]+)'
+    match = re.search(pattern, alert, re.IGNORECASE)
+
+    if match:
+        exp_date, ticker, strike, otype, price = match.groups()
+        # formatted_alert = f"BTO {ticker.upper()} {strike}{otype.upper()} {exp_date} @{str(round(float(price)*0.87,2))}"
+        formatted_alert = f"BTO {ticker.upper()} {strike}{otype.upper()} {exp_date} @{price}"
+        message.content = formatted_alert
+    return message
+
+def gandalf_formatting(message_):
+    """
+    Reformat Discord message from gandalf
+    BTO SPY $596C 3/4 @ $0.42
+    """
+    message = MessageCopy(message_)
+    alert = message.content
+    pattern = r'BTO\s+([A-Z]+)\s+\$(\d+)([cCpP])\s+(\d{1,2}/\d{1,2})\s+@\s+\$+([\d.]+)'
+    match = re.search(pattern, alert, re.IGNORECASE)
+    if match:
+        ticker, strike,  otype, exp_date, price = match.groups()
+        # formatted_alert = f"BTO {ticker.upper()} {strike}{otype.upper()} {exp_date} @{price}"
+        formatted_alert = f"BTO {ticker.upper()} {strike}{otype.upper()} {exp_date} @{str(round(float(price)*0.87,2))}"
+        message.content = formatted_alert
+
+    return message
+
+def adex_formatting(message_):
+    """
+    Reformat Discord message from Adex_swing
+    'Entered: $ENPH 60P 3/14 @2.40'
+    """
+    message = MessageCopy(message_)
+    alert = message.content
+
+    pattern = pattern = r'\$([A-Z]+)\s+(\d+)([cCpP])\s+(\d{1,2}/\d{1,2})\s+@([\d.]+)'
+    match = re.search(pattern, alert, re.IGNORECASE)
+
+    if match:
+        ticker,  strike, otype, exp_date, price = match.groups()
+        # formatted_alert = f"BTO {ticker.upper()} {strike}{otype.upper()} {exp_date} @{price}"
+        formatted_alert = f"BTO {ticker.upper()} {strike}{otype.upper()} {exp_date} @{str(round(float(price)*0.9,2))}"
+        message.content = formatted_alert
+
     return message
 
 def tradeproelite_formatting(message_):
@@ -370,38 +449,6 @@ def chis_formatting(message_):
         formatted_alert = f"BTO SPY {strike.upper()}{otype.upper()} {msg_date} @{price}"
         message.content = formatted_alert
 
-    return message
-
-def abi_formatting(message_):
-    """
-    Reformat Discord message from Abi
-    """
-    message = MessageCopy(message_)
-    alert = message.content
-    
-    pattern_with_date = r'\$([A-Z]+)\s+(\d{1,2}/\d{1,2})\s+(\d+)([cCpP])\s+([\d.]+)'
-    pattern_without_date = r'\$([A-Z]+)\s+(\d+)([cCpP])\s+([\d.]+)'
-    
-    match = re.search(pattern_with_date, alert, re.IGNORECASE)
-    if match:
-        ticker, exp_date, strike, otype, price = match.groups()
-    else:
-        match = re.search(pattern_without_date, alert, re.IGNORECASE)
-        if match:
-            ticker, strike, otype, price = match.groups()
-            today = datetime.today()
-            if today.weekday() == 4:
-                exp_date = today.strftime('%m/%d')
-            else:
-                days_until_friday = (4 - today.weekday()) % 7 
-                upcoming_friday = today + timedelta(days=days_until_friday)
-                exp_date = upcoming_friday.strftime('%m/%d')
-        else:
-            return message
-    
-    formatted_alert = f"BTO {ticker.upper()} {strike}{otype.upper()} {exp_date} @{price}"
-    message.content = formatted_alert
-    
     return message
 
 def jpa_formatting(message_):
@@ -1309,3 +1356,27 @@ class EmbedCopy:
         self.title = original_embed.title
         self.description = original_embed.description
         self.fields = [EmbedFieldCopy(field) for field in original_embed.fields]
+
+# if __name__ == '__main__':
+#     """
+#     Reformat Discord message from gandalf
+#     BTO SPY $596C 3/4 @ $ 0.42
+#     """
+#     alert = 'BTO SPY $596C 3/4 @ $0.42'
+#     pattern = r'BTO\s+([A-Z]+)\s+\$(\d+)([cCpP])\s+(\d{1,2}/\d{1,2})\s+@\s+\$+([\d.]+)'
+#     match = re.search(pattern, alert, re.IGNORECASE)
+#     if match:
+#         ticker, strike,  otype, exp_date, price = match.groups()
+#         # formatted_alert = f"BTO {ticker.upper()} {strike}{otype.upper()} {exp_date} @{price}"
+#         formatted_alert = f"BTO {ticker.upper()} {strike}{otype.upper()} {exp_date} @{str(round(float(price)*0.87,2))}"
+
+#     print(formatted_alert)
+# if __name__ == '__main__':
+#     alert = '5/23 $GAP 29c @.32'
+#     pattern = r'(\d{1,2}/\d{1,2})\s+\$([A-Z]+)\s+(\d+)([cCpP])\s+@([\d.]+)'
+#     match = re.search(pattern, alert, re.IGNORECASE)
+#     if match:
+#         exp_date, ticker, strike, otype, price = match.groups()
+#         # formatted_alert = f"BTO {ticker.upper()} {strike}{otype.upper()} {exp_date} @{str(round(float(price)*0.87,2))}"
+#         formatted_alert = f"BTO {ticker.upper()} {strike}{otype.upper()} {exp_date} @{price}"
+#     print(formatted_alert)
