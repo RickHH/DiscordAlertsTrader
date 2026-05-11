@@ -4,18 +4,21 @@
 Created on Sat Apr  3 18:18:43 2021
 
 @author: adonay
+
+Optimized version with type hints and better organization.
 """
+from __future__ import annotations
+
 import os
 import os.path as op
 import threading
+from typing import Optional, Dict, Any, List, Tuple, Union
 import pandas as pd
 from datetime import datetime
 import time
 import re
 import queue
 import PySimpleGUIQt as sg
-# from PySide2.QtWidgets import QHeaderView
-import matplotlib.pyplot as plt
 
 from DiscordAlertsTrader.brokerages import get_brokerage
 from DiscordAlertsTrader import gui_generator as gg
@@ -23,12 +26,16 @@ from DiscordAlertsTrader import gui_layouts as gl
 from DiscordAlertsTrader.discord_bot import DiscordBot
 from DiscordAlertsTrader.configurator import cfg, channel_ids
 from DiscordAlertsTrader.message_parser import parse_trade_alert, ordersymb_to_str
-# A fix for Macs
+from DiscordAlertsTrader.utils.logging_utils import GUI_LOGGER, print_warning
+
 os.environ['QT_MAC_WANTS_LAYER'] = '1'
 
+_author_cache: Optional[List[str]] = None
 
-def match_authors(author_str:str)->str:
-    """Author have an identifier in discord, it will try to find full author name
+
+def match_authors(author_str: str) -> str:
+    """
+    Author have an identifier in discord, it will try to find full author name.
 
     Parameters
     ----------
@@ -40,23 +47,36 @@ def match_authors(author_str:str)->str:
     str
         author with identifier
     """
+    global _author_cache
+
     if "#" in author_str:
         return author_str
-    authors = []
-    for chn in channel_ids.keys():
-        at = pd.read_csv(op.join(cfg['general']['data_dir'] , f"{chn}_message_history.csv"))["Author"].unique()
-        authors.extend(at)
-    authors = list(dict.fromkeys(authors))
-    
-    authors += cfg['discord']['authors_subscribed'].split(',')
-    authors = [a for a in authors if author_str.lower() in a.lower()]
-    if len(authors) == 0:
-        author = author_str
-    elif len(authors) > 1:
-        author = author_str
+
+    if _author_cache is None:
+        _author_cache = []
+        for chn in channel_ids.keys():
+            hist_file = op.join(cfg['general']['data_dir'], f"{chn}_message_history.csv")
+            if op.exists(hist_file):
+                authors = pd.read_csv(hist_file, usecols=["Author"])["Author"].unique().tolist()
+                _author_cache.extend(authors)
+        _author_cache = list(dict.fromkeys(_author_cache))
+        subscribed = cfg['discord']['authors_subscribed'].split(',')
+        _author_cache.extend([a for a in subscribed if a])
+
+    matching = [a for a in _author_cache if author_str.lower() in a.lower()]
+
+    if len(matching) == 0:
+        return author_str
+    elif len(matching) > 1:
+        return author_str
     else:
-        author = authors[0]
-    return author
+        return matching[0]
+
+
+def invalidate_author_cache() -> None:
+    """Clear the author cache when message history changes."""
+    global _author_cache
+    _author_cache = None
 
 def split_alert_message(gui_msg):
     # extra comas
@@ -83,45 +103,56 @@ def split_alert_message(gui_msg):
         msg = gui_msg
     return author, msg
 
-def get_live_quotes(symbol, tracker, max_delay=2):
-    dir_quotes = cfg['general']['data_dir'] + '/live_quotes'
-    
+def get_live_quotes(symbol: str, tracker: Any, max_delay: float = 2) -> Tuple[Optional[List[float]], Optional[List[float]]]:
+    """Get live quotes for a symbol with caching."""
+    dir_quotes = op.join(cfg['general']['data_dir'], 'live_quotes')
+
     fquote = f"{dir_quotes}/{symbol}.csv"
     if not op.exists(fquote):
         quote = tracker.price_now(symbol, "both")
         if quote is None:
-            return None, None        
+            return None, None
         return quote
-    
-    with open(fquote, "r") as f:
-        quotes = f.readlines()
-    
-    now = time.time()
-    get_live = False
+
     try:
-        tmp = quotes[-1].split(',') # in s  
-        if len(tmp) == 3:
-            timestamp, bid, ask = tmp
-        else:
-            timestamp, ask = tmp
-            bid = ask
-        ask = ask.strip().replace('\n', '')
-        quote = [ask, bid]
-    except:
-        print("Error reading quote", symbol, quotes[-1])
-        get_live = True
-    
-    timestamp = eval(timestamp)
-    if max_delay is not None:
-        if now - timestamp > max_delay:
+        with open(fquote, "r") as f:
+            quotes = f.readlines()
+
+        now = time.time()
+        get_live = False
+
+        try:
+            tmp = quotes[-1].split(',')
+            if len(tmp) == 3:
+                timestamp, bid, ask = tmp
+            else:
+                timestamp, ask = tmp
+                bid = ask
+            ask = ask.strip().replace('\n', '')
+            quote = [float(ask), float(bid)]
+        except (ValueError, IndexError) as e:
+            GUI_LOGGER.warning(f"Error reading quote {symbol}: {e}")
             get_live = True
-    
-    if get_live:
-        quote = tracker.price_now(symbol, "both")
-        if quote is None:
-            return None, None        
+            quote = None
+
+        if not get_live and quote:
+            try:
+                timestamp = float(timestamp)
+                if max_delay is not None and now - timestamp > max_delay:
+                    get_live = True
+            except ValueError:
+                get_live = True
+
+        if get_live:
+            quote = tracker.price_now(symbol, "both")
+            if quote is None:
+                return None, None
+            return quote
+
         return quote
-    return quote
+    except Exception as e:
+        GUI_LOGGER.error(f"Error getting live quotes for {symbol}: {e}")
+        return None, None
 
 
 def quotes_plotting(symbol, trader=None, tracker=None):

@@ -3,27 +3,31 @@ import numpy as np
 import copy
 import os.path as op
 from datetime import datetime, date
+from typing import Optional, Any, Dict
 
-from.message_parser import parse_option_under
+from .message_parser import parse_option_under
 from .alerts_trader import find_last_trade, option_date
 from .configurator import cfg
+from .utils.safe_eval import safe_eval
+from .utils.logging_utils import TRADER_LOGGER
 
-def get_date():
+def get_date() -> str:
     time_strf = "%Y-%m-%d %H:%M:%S.%f"
-    date = datetime.now().strftime(time_strf)
-    return date
+    return datetime.now().strftime(time_strf)
 
 
 class AlertsTracker():
 
-    def __init__(self, brokerage=None,
-                 portfolio_fname=cfg['portfolio_names']["tracker_portfolio_name"],
-                 dir_quotes = cfg['general']['data_dir'] + '/live_quotes',
-                 cfg=cfg,
-                 do_avg=False):
-
+    def __init__(
+        self,
+        brokerage: Any = None,
+        portfolio_fname: str = cfg['portfolio_names']["tracker_portfolio_name"],
+        dir_quotes: str = None,
+        cfg: Any = cfg,
+        do_avg: bool = False
+    ):
         self.portfolio_fname = portfolio_fname
-        self.dir_quotes = dir_quotes
+        self.dir_quotes = dir_quotes or op.join(cfg['general']['data_dir'], 'live_quotes')
         self.bksession = brokerage
         self.cfg = cfg
         self.do_avg = do_avg
@@ -33,7 +37,7 @@ class AlertsTracker():
             if "underlying" not in self.portfolio.columns:
                 self.portfolio['underlying'] = None
         else:
-            self.portfolio = pd.DataFrame(columns=self.cfg["col_names"]['tracker_portfolio'].split(",") )
+            self.portfolio = pd.DataFrame(columns=self.cfg["col_names"]['tracker_portfolio'].split(","))
             self.portfolio.to_csv(self.portfolio_fname, index=False)
 
     def price_now(self, symbol:str, price_type="BTO"):
@@ -136,7 +140,8 @@ class AlertsTracker():
             str_act += f", SL:{order['SL']}"
         return str_act
 
-    def make_BTO_Avg(self, order, open_trade):
+    def make_BTO_Avg(self, order: Dict, open_trade: int) -> str:
+        """Process average down (adding to existing position)."""
         actual_Avg = self.portfolio.loc[open_trade, "Avged"]
         if np.isnan(actual_Avg):
             actual_Avg = 1
@@ -144,10 +149,10 @@ class AlertsTracker():
             actual_Avg = int(actual_Avg + 1)
 
         old_price = self.portfolio.loc[open_trade, "Price"]
-        old_price = eval(old_price) if isinstance(old_price, str) else old_price
+        old_price = safe_eval(str(old_price)) if isinstance(old_price, str) else old_price
         old_qty = self.portfolio.loc[open_trade, "Qty"]
         alert_price_old = self.portfolio.loc[open_trade, "Price-actual"]
-        alert_price_old = eval(alert_price_old) if isinstance(alert_price_old, str) else alert_price_old
+        alert_price_old = safe_eval(str(alert_price_old)) if isinstance(alert_price_old, str) else alert_price_old
         alert_price_old = None if pd.isnull(alert_price_old) else alert_price_old
         alert_price = order.get("Actual Cost", "None")
         avgs_prices_al = f"{alert_price_old}/{alert_price}".replace("None/", "").replace("/None", "").replace("None", "")
@@ -169,10 +174,10 @@ class AlertsTracker():
         str_act = f"{order['action']} {order['Symbol']} {actual_Avg}th averging down @ {order['price']}"
         return str_act
 
-    def make_STC(self, order, open_trade, check_trail=False):
+    def make_STC(self, order: Dict, open_trade: int, check_trail: bool = False) -> str:
+        """Process sell to close order."""
         trade = self.portfolio.loc[open_trade]
         stc_info = calc_stc_prices(trade, order)
-        #Log portfolio
         for k, v in stc_info.items():
             self.portfolio.loc[open_trade, k] = v
 
@@ -189,7 +194,6 @@ class AlertsTracker():
         if stc_price == "none" or stc_price is None:
             str_STC = f"{order['action']} {order['Symbol']}  ({order['Qty']}), no price provided" + suffx
         else:
-            # str_STC = f"STC {order['Symbol']} ({order['Qty']}),{suffx} @{stc_price:.2f}"
             str_STC = ""
             if stc_info['STC-Price-actual'] is not None:
                 str_STC += f"\t@{stc_price:.2f}, actual: {stc_info['STC-Price-actual']:.2f} "
@@ -198,7 +202,7 @@ class AlertsTracker():
             if stc_info["PnL-actual"] is not None:
                 str_STC += f' Actual:{round(stc_info["PnL-actual"])}% ${round(stc_info["PnL$-actual"])}\n\t\t'
 
-        if eval(order.get('# Closed', "0"))==1 :
+        if safe_eval(order.get('# Closed', "0")) == 1:
             self.portfolio.loc[open_trade, "isOpen"]=0
         str_STC = str_STC + " " + trailstat.replace('| ', '\n\t')
         return str_STC
@@ -296,11 +300,11 @@ def calc_stc_prices(trade, order=None):
             Qty = trade['Qty'] - trade["STC-Qty"]
 
     if isinstance(bto_price, str):
-        bto_price =  np.mean(eval(bto_price.replace("/", ",")))
+        bto_price =  np.mean([safe_eval(x) for x in bto_price.replace("/", ",").split(",") if x.strip()])
     if isinstance(bto_price_al, str):
         if bto_price_al[0] == '/':
             bto_price_al = bto_price_al[1:]
-        bto_price_al =  np.mean(eval(bto_price_al.replace("/", ",")))
+        bto_price_al =  np.mean([safe_eval(x) for x in bto_price_al.replace("/", ",").split(",") if x.strip()])
 
     if not pd.isnull(trade["STC-Price"]):  # previous stcs
         stc_wprice = trade["STC-Price"] * trade["STC-Qty"]

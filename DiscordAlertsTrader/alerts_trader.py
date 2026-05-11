@@ -4,9 +4,15 @@
 Created on Sat Feb 27 09:26:06 2021
 
 @author: adonay
+
+Optimized version with type hints and safe evaluation.
 """
+from __future__ import annotations
+
 import re
 import os.path as op
+import json
+from typing import Optional, Dict, Any, Union, List, Tuple, Callable
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, date
@@ -17,86 +23,122 @@ from colorama import Fore, Back
 
 from DiscordAlertsTrader.configurator import cfg
 from DiscordAlertsTrader.message_parser import parse_exit_plan, set_exit_price_type, ordersymb_to_str
+from DiscordAlertsTrader.utils.safe_eval import (
+    safe_eval, safe_json_eval, ConfigValues, parse_trailing_stop_string, ExitPlan
+)
+from DiscordAlertsTrader.utils.logging_utils import (
+    print_success, print_error, print_warning, TRADER_LOGGER, ErrorHandler
+)
 
 
-def find_last_trade(order, trades_log, open_only=True):
+def find_last_trade(
+    order: Dict[str, Any],
+    trades_log: pd.DataFrame,
+    open_only: bool = True
+) -> Tuple[Optional[int], int]:
+    """
+    Find the last trade matching the order criteria.
+
+    Args:
+        order: Order dictionary with 'Trader', 'Symbol', 'asset' keys
+        trades_log: DataFrame of all trades
+        open_only: If True, only return open trades
+
+    Returns:
+        Tuple of (trade_index, is_open_status)
+    """
+    if trades_log.empty:
+        return None, 0
+
     trades_authr = trades_log["Trader"] == order["Trader"]
-    trades_log = trades_log.loc[trades_authr]
+    trades_log = trades_log.loc[trades_authr].copy()
 
     msk_ticker = trades_log["Symbol"].str.match(f"{order['Symbol']}$")
 
-    # Order ticker without dates and strike
-    if sum(msk_ticker) == 0 and order['asset'] == 'option':
+    if sum(msk_ticker) == 0 and order.get('asset') == 'option':
         trades_log = trades_log[trades_log["Asset"] == "option"]
         trade_symb = trades_log["Symbol"].apply(lambda x: x.split("_")[0])
-
         msk_ticker = trade_symb.str.match(f"{order['Symbol']}$")
 
     if sum(msk_ticker) == 1:
         last_trade, = trades_log[msk_ticker].index.values
-    # Either take open trade or last
     elif sum(msk_ticker) > 1:
         open_trade = trades_log.loc[msk_ticker, "isOpen"]
         if open_trade.sum() == 1:
-            last_trade, = open_trade.index[open_trade==1]
+            last_trade, = open_trade.index[open_trade == 1]
         elif open_trade.sum() > 1:
-            # raise ValueError ("Trade with more than one open position")
-            last_trade = open_trade.index[open_trade==1][-1]
+            last_trade = open_trade.index[open_trade == 1][-1]
         elif open_trade.sum() == 0:
             last_trade = open_trade.index[-1]
     else:
         return None, 0
 
-    isOpen = trades_log.loc[last_trade, 'isOpen']
+    isOpen = int(trades_log.loc[last_trade, 'isOpen'])
 
     if open_only and isOpen == 0:
         return None, 0
     else:
-        return last_trade, isOpen
+        return int(last_trade), isOpen
 
 
 class AlertsTrader():
-    def __init__(self,
-                 brokerage,
-                 portfolio_fname=cfg['portfolio_names']['portfolio_fname'] ,
-                 alerts_log_fname=cfg['portfolio_names']['alerts_log_fname'],
-                 queue_prints=queue.Queue(maxsize=10),
-                 update_portfolio=True,
-                 cfg=cfg
-                 ):
+    DEFAULT_UPDATE_RATE = 10
+    DEFAULT_MAX_STC_ORDERS = 4
+
+    def __init__(
+        self,
+        brokerage: Any,
+        portfolio_fname: str = cfg['portfolio_names']['portfolio_fname'],
+        alerts_log_fname: str = cfg['portfolio_names']['alerts_log_fname'],
+        queue_prints: queue.Queue = None,
+        update_portfolio: bool = True,
+        cfg: Any = cfg
+    ):
         self.bksession = brokerage
         self.portfolio_fname = portfolio_fname
         self.alerts_log_fname = alerts_log_fname
-        self.queue_prints = queue_prints
+        self.queue_prints = queue_prints or queue.Queue(maxsize=10)
         self.send_alert_to_discord = cfg['discord'].getboolean('notify_alerts_to_discord')
-        self.discord_channel = None # discord channel object to post trade alerts, passed on_ready discord
+        self.discord_channel = None
         self.cfg = cfg
-        self.EOD = {} # end of day shorting actions
-        self.order_update_rate = 10
-        self.max_stc_orders = int(cfg['order_configs']['max_stc_orders']) + 1
-        # load port and log
+        self.EOD: Dict[str, str] = {}
+        self.order_update_rate = self.DEFAULT_UPDATE_RATE
+
+        max_stc_orders = ConfigValues.parse_number(cfg['order_configs']['max_stc_orders'])
+        self.max_stc_orders = int(max_stc_orders or self.DEFAULT_MAX_STC_ORDERS) + 1
+
+        portfolio_cols = cfg["col_names"]['portfolio'].split(",")
         if op.exists(self.portfolio_fname):
             self.portfolio = pd.read_csv(self.portfolio_fname, na_values=[''])
         else:
-            self.portfolio = pd.DataFrame(columns=self.cfg["col_names"]['portfolio'].split(",") )
+            self.portfolio = pd.DataFrame(columns=portfolio_cols)
             self.portfolio.to_csv(self.portfolio_fname, index=False)
+
+        alerts_cols = cfg["col_names"]['alerts_log'].split(",")
         if op.exists(self.alerts_log_fname):
             self.alerts_log = pd.read_csv(self.alerts_log_fname, na_values=[''])
         else:
-            self.alerts_log = pd.DataFrame(columns=self.cfg["col_names"]['alerts_log'].split(","))
+            self.alerts_log = pd.DataFrame(columns=alerts_cols)
             self.alerts_log.to_csv(self.alerts_log_fname, index=False)
 
         self.update_portfolio = update_portfolio
         self.update_paused = False
+
+        self._dirty_flag = False
+        self._last_save_time = time.time()
+        self._save_interval = 60
+
         if update_portfolio:
-            # first do a synch, then thread it
             self.update_orders()
             self.updater = threading.Thread(target=self.trade_updater, daemon=True)
             self.updater.start()
-            self.queue_prints.put([f"Updating portfolio orders every {self.order_update_rate} secs", "", "green"])
-            print(Back.GREEN + f"Updating portfolio orders every {self.order_update_rate} secs")
+            msg = f"Updating portfolio orders every {self.order_update_rate} secs"
+            self.queue_prints.put([msg, "", "green"])
+            print(Back.GREEN + msg)
+            TRADER_LOGGER.info(msg)
 
-    def trade_updater(self):
+    def trade_updater(self) -> None:
+        """Background thread for updating portfolio orders periodically."""
         while self.update_portfolio is True:
             if self.update_paused is True:
                 time.sleep(0.5)
@@ -105,22 +147,81 @@ class AlertsTrader():
             try:
                 self.update_orders()
             except Exception as ex:
+                ErrorHandler.handle_brokerage_error(
+                    ex,
+                    "portfolio update",
+                    TRADER_LOGGER
+                )
                 str_msg = f"Error raised during port update, trying again later. Error: {ex}"
                 print(Back.RED + str_msg)
                 self.queue_prints.put([str_msg, "", "red"])
-            
+
             if time.time() - t0 < self.order_update_rate:
                 time.sleep(self.order_update_rate - (time.time() - t0))
-        
+
         str_msg = "Closed portfolio updater"
         print(Back.GREEN + str_msg)
         self.queue_prints.put([str_msg, "", "green"])
 
-    def save_logs(self, csvs=["port", "alert"]):
-        if "port" in csvs:
-            self.portfolio.to_csv(self.portfolio_fname, index=False)
-        if "alert" in csvs:
-            self.alerts_log.to_csv(self.alerts_log_fname, index=False)
+    def save_logs(self, csvs: List[str] = None) -> None:
+        """Save portfolio and alerts log to CSV files."""
+        if csvs is None:
+            csvs = ["port", "alert"]
+
+        self._dirty_flag = True
+
+        try:
+            if "port" in csvs:
+                self.portfolio.to_csv(self.portfolio_fname, index=False)
+                TRADER_LOGGER.debug(f"Saved portfolio to {self.portfolio_fname}")
+            if "alert" in csvs:
+                self.alerts_log.to_csv(self.alerts_log_fname, index=False)
+                TRADER_LOGGER.debug(f"Saved alerts log to {self.alerts_log_fname}")
+            self._dirty_flag = False
+        except Exception as e:
+            TRADER_LOGGER.error(f"Failed to save logs: {e}")
+
+    def should_save(self) -> bool:
+        """Check if enough time has passed since last save."""
+        return time.time() - self._last_save_time >= self._save_interval
+
+    def mark_dirty(self) -> None:
+        """Mark data as modified for batch saving."""
+        self._dirty_flag = True
+
+    def try_save(self) -> None:
+        """Try to save if data is dirty and enough time has passed."""
+        if self._dirty_flag and self.should_save():
+            self.save_logs()
+            self._last_save_time = time.time()
+
+    def _parse_exit_plan(self, plan_str: Any) -> Dict[str, Any]:
+        """Safely parse exit plan from string."""
+        if plan_str is None or plan_str == 'None' or plan_str == '{}':
+            return {'PT1': None, 'PT2': None, 'PT3': None, 'SL': None}
+        if isinstance(plan_str, dict):
+            return plan_str
+        return safe_json_eval(str(plan_str))
+
+    def _parse_avg_down(self, avg_down_str: Any) -> Dict[str, Any]:
+        """Safely parse avg_down configuration."""
+        if avg_down_str is None or pd.isna(avg_down_str):
+            return {}
+        if isinstance(avg_down_str, dict):
+            return avg_down_str
+        return safe_json_eval(str(avg_down_str))
+
+    def _parse_trailing_value(self, value: str) -> float:
+        """Safely parse trailing stop value."""
+        if value is None:
+            return 0
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            try:
+                return safe_eval(str(value))
+            except Exception:
+                return 0
 
     def order_to_pars(self, order):
         pars_str = f"{order['action']} {order['Symbol']} @{order['price']}"
@@ -224,115 +325,126 @@ class AlertsTrader():
             elif resp in ["no", "n"]:
                 return None, None, order, None
 
-    def short_orders(self, order, pars):
-        if order['action'] == "STO" :
+    def short_orders(self, order: Dict[str, Any], pars: str) -> Tuple[str, Dict[str, Any], bool]:
+        """Handle short (STO) orders with validation."""
+        if order['action'] == "STO":
             if order['asset'] == "option":
-                # check strike
-                strike = eval(re.split("C|P", order['Symbol'].split("_")[1])[1])
-                if strike > eval(self.cfg['shorting']['max_strike']):
+                strike_str = re.split("C|P", order['Symbol'].split("_")[1])[1]
+                try:
+                    strike = float(strike_str)
+                except ValueError:
+                    strike = 0
+
+                max_strike = ConfigValues.parse_number(self.cfg['shorting']['max_strike'])
+                if max_strike and strike > max_strike:
                     str_msg = f"STO strike too high: {strike}, order aborted"
                     print(Back.RED + str_msg)
                     self.queue_prints.put([str_msg, "", "red"])
                     return "no", order, False
-                
-                # check DTE
-                if len(self.cfg['shorting']['max_dte']):
+
+                max_dte_str = self.cfg['shorting']['max_dte']
+                if max_dte_str and len(max_dte_str):
                     if order.get('dte') is None:
-                        exp_dt = datetime.strptime(f"{order['expDate']}/{datetime.now().year}" , "%m/%d/%Y").date()
+                        exp_dt = datetime.strptime(f"{order['expDate']}/{datetime.now().year}", "%m/%d/%Y").date()
                         dt = datetime.now().date()
-                        order['dte'] =  (exp_dt - dt).days
-                    if order['dte'] > int(self.cfg['shorting']['max_dte']):
-                        str_msg = f"STO {order['dte']} DTE larger than max in config: {self.cfg['shorting']['max_dte']}, order aborted"
+                        order['dte'] = (exp_dt - dt).days
+                    max_dte = ConfigValues.parse_number(max_dte_str)
+                    if max_dte and order['dte'] > max_dte:
+                        str_msg = f"STO {order['dte']} DTE larger than max in config: {max_dte}, order aborted"
                         print(Back.RED + str_msg)
                         self.queue_prints.put([str_msg, "", "red"])
                         return "no", order, False
-                
-                # check if above min price
-                if len(self.cfg['shorting']['min_price']):
-                    min_price = float(self.cfg['shorting']['min_price'])
-                    if (order['price']*100) < min_price:
-                        str_msg = f"STO price too low: {order['price']*100}, order aborted"
+
+                min_price_str = self.cfg['shorting']['min_price']
+                if min_price_str and len(min_price_str):
+                    min_price = ConfigValues.parse_number(min_price_str)
+                    if min_price and (order['price'] * 100) < min_price:
+                        str_msg = f"STO price too low: {order['price'] * 100}, order aborted"
                         print(Back.RED + str_msg)
                         self.queue_prints.put([str_msg, "", "red"])
                         return "no", order, False
-            
-            # use current price as ask, bid, mid, last, or alert
-            sto_price = cfg['shorting']['STO_price']
+
+            sto_price = self.cfg['shorting']['STO_price']
             check_price = True
             if sto_price == 'alert':
-                check_price = False            
+                check_price = False
             ptype = "BTO" if sto_price in ["ask", "mid"] else "last" if sto_price == "last" else "STO"
             if check_price:
-                order["price_actual"] = self.price_now(order['Symbol'], ptype, 1 )
+                order["price_actual"] = self.price_now(order['Symbol'], ptype, 1)
             else:
                 order["price_actual"] = order['price']
-            pdiff = round((order['price']-order["price_actual"])/order['price']*100,1)
-            
-            if self.cfg['shorting']['STO_trailingstop'] != "":                            
-                # if pdiff too large, trigger trailing only when price target
-                if pdiff > eval(self.cfg['shorting']['max_price_diff']):
-                    order['price_trigger'] = order["price_actual"]      
+
+            if order["price_actual"] and order['price']:
+                pdiff = round((order['price'] - order["price_actual"]) / order['price'] * 100, 1)
+            else:
+                pdiff = 0
+
+            sto_trailing = self.cfg['shorting']['STO_trailingstop']
+            max_price_diff = ConfigValues.parse_number(self.cfg['shorting']['max_price_diff'])
+            if sto_trailing and sto_trailing != "":
+                if max_price_diff and pdiff > max_price_diff:
+                    order['price_trigger'] = order["price_actual"]
                     str_msg = f"STO alert price diff too high: {pdiff}% at {order['price_actual']}, trailing will trigger at {order['price']}"
                     print(Back.GREEN + str_msg)
                     self.queue_prints.put([str_msg, "", "green"])
-                trail = (float(self.cfg['shorting']['STO_trailingstop'])/100)*order["price_actual"]  
+                trail = (float(sto_trailing) / 100) * order["price_actual"]
                 order["trail_stop_const"] = -round(trail / 0.01) * 0.01
-            
             else:
-                # if price diff not too high, use current price
-                if pdiff < eval(self.cfg['shorting']['max_price_diff']):
+                if max_price_diff is None or pdiff < max_price_diff:
                     if check_price:
                         if sto_price == 'mid':
-                            p1 = self.price_now(order['Symbol'], "BTO", 1 )
-                            p2 = self.price_now(order['Symbol'], "STO", 1 )
-                            order['price'] = (p1+p2)/2
+                            p1 = self.price_now(order['Symbol'], "BTO", 1)
+                            p2 = self.price_now(order['Symbol'], "STO", 1)
+                            order['price'] = (p1 + p2) / 2
                             if order['price'] < 1 and order['asset'] == "stock":
                                 order['price'] = round(order['price'], 3)
                             else:
                                 order['price'] = round(order['price'], 2)
                         else:
                             order['price'] = order['price_actual']
-                    else:   
+                    else:
                         order['price'] = order['price_actual']
                 else:
                     str_msg = f"STO alert price diff too high: {pdiff}% at {order['price_actual']}, keeping original price of {order['price']}"
                     print(Back.GREEN + str_msg)
                     self.queue_prints.put([str_msg, "", "green"])
-            
-            # Handle quantity  
+
             if order.get("Qty") is not None and not self.cfg['shorting'].getboolean('ignore_alert_qty'):
                 order['trader_qty'] = order['Qty']
             elif self.cfg['shorting']['default_sto_qty'] == "buy_one":
-                order['Qty'] = 1                    
+                order['Qty'] = 1
             elif self.cfg['shorting']['default_sto_qty'] == "margin_capital" and order['asset'] == "option":
-                order['Qty'] = max(1, int(eval(self.cfg['shorting']['margin_capital'])/(20*strike)))
+                margin_capital = ConfigValues.parse_number(self.cfg['shorting']['margin_capital']) or 20000
+                order['Qty'] = max(1, int(margin_capital / (20 * strike)))
             elif self.cfg['shorting']['default_sto_qty'] == "trade_capital" or order['asset'] == "stock":
+                trade_capital = ConfigValues.parse_number(self.cfg['shorting']['trade_capital']) or 300
                 if order['asset'] == "option":
-                    order['Qty'] =  int(max(round(float(self.cfg['shorting']['trade_capital'])/(100*order['price'])), 1))
+                    order['Qty'] = int(max(round(trade_capital / (100 * order['price'])), 1))
                 else:
-                    order['Qty'] = int(max(float(self.cfg['shorting']['trade_capital'])//order['price'], 1))
+                    order['Qty'] = int(max(trade_capital // order['price'], 1))
 
-            # Handle trade cost lims
-            max_trade_val = float(self.cfg['shorting']['max_trade_capital'])
-            if 100*order['price'] * order['Qty'] > max_trade_val and order['asset'] == "option":
+            max_trade_cap = ConfigValues.parse_number(self.cfg['shorting']['max_trade_capital']) or 5000
+            min_trade_cap = ConfigValues.parse_number(self.cfg['shorting']['min_trade_capital']) or 100
+
+            if 100 * order['price'] * order['Qty'] > max_trade_cap and order['asset'] == "option":
                 Qty_ori = order['Qty']
-                order['Qty'] =  int(max(max_trade_val//(100*order['price']), 1))
-                if order['price'] * order['Qty'] <= max_trade_val:
-                    str_msg = f"STO trade exeeded max_trade_capital of ${max_trade_val}, order quantity reduced to {order['Qty']} from {Qty_ori}"
+                order['Qty'] = int(max(max_trade_cap // (100 * order['price']), 1))
+                if order['price'] * order['Qty'] <= max_trade_cap:
+                    str_msg = f"STO trade exceeded max_trade_capital of ${max_trade_cap}, order quantity reduced to {order['Qty']} from {Qty_ori}"
                     print(Back.GREEN + str_msg)
                     self.queue_prints.put([str_msg, "", "green"])
                 else:
-                    str_msg = f"cancelled STO: trade exeeded max_trade_capital of ${max_trade_val}"
+                    str_msg = f"cancelled STO: trade exceeded max_trade_capital of ${max_trade_cap}"
                     print(Back.RED + str_msg)
                     self.queue_prints.put([str_msg, "", "red"])
                     return "no", order, False
-            elif 100*order['price'] * order['Qty'] < float(self.cfg['shorting']['min_trade_capital']) and order['asset'] == "option":
-                str_msg = f"STO trade below min_trade_capital of ${self.cfg['shorting']['min_trade_capital']}, order aborted"
+            elif 100 * order['price'] * order['Qty'] < min_trade_cap and order['asset'] == "option":
+                str_msg = f"STO trade below min_trade_capital of ${min_trade_cap}, order aborted"
                 print(Back.RED + str_msg)
                 self.queue_prints.put([str_msg, "", "red"])
                 return "no", order, False
-            elif order['asset'] == "stock" and order['price'] * order['Qty'] > max_trade_val:
-                str_msg = f"STO trade below min_trade_capital of ${self.cfg['shorting']['min_trade_capital']}, order aborted"
+            elif order['asset'] == "stock" and order['price'] * order['Qty'] > max_trade_cap:
+                str_msg = f"STO trade below min_trade_capital of ${min_trade_cap}, order aborted"
                 print(Back.RED + str_msg)
                 self.queue_prints.put([str_msg, "", "red"])
                 return "no", order, False
@@ -368,25 +480,26 @@ class AlertsTrader():
             question = f"{pars_ori} currently @ {actual_price}"
             if order['action'] in ["STO", "BTC"]:
                 return self.short_orders(order, pars)
-            
+
             elif self.cfg['order_configs'].getboolean('sell_current_price'):
-                if pdiff < eval(self.cfg['order_configs']['max_price_diff'])[order["asset"]]:
+                max_price_diff = ConfigValues.parse_dict(self.cfg['order_configs']['max_price_diff'])
+                diff_limit = max_price_diff.get(order["asset"], 5) if isinstance(max_price_diff, dict) else 5
+                if pdiff < diff_limit:
                     order['price'] = actual_price
                     if order['action'] in ["BTO", "STC"]:
-                        # reduce 1% to ensure fill
                         if order['action'] == "BTO":
                             if order['price'] < 1 and order['asset'] == "stock":
-                                new_price =  round(order['price']*1.05,3)
+                                new_price = round(order['price'] * 1.05, 3)
                             else:
-                                new_price =  round(order['price']*1.05,2)
+                                new_price = round(order['price'] * 1.05, 2)
                         elif order['action'] == "STC":
                             if order['price'] < 1 and order['asset'] == "stock":
-                                new_price =  round(order['price']*.95,3)
+                                new_price = round(order['price'] * 0.95, 3)
                             else:
-                                new_price =  round(order['price']*.95,2)
-                    
+                                new_price = round(order['price'] * 0.95, 2)
+
                     order['price'] = self.round_price(new_price, order)
-                    
+
                     pars = self.order_to_pars(order)
                     question += f"\n new price: {pars}"
                 else:
@@ -401,89 +514,105 @@ class AlertsTrader():
                     print(Back.GREEN + str_msg)
                     self.queue_prints.put([str_msg, "", "green"])
                     return "no", order, False
-                
+
                 elif order['action'] == "BTO":
-                    if len(cfg['order_configs']['exclude_tickers']):
-                        no_trade = cfg['order_configs']['exclude_tickers'].split(',')
-                        no_trade = [i.strip() for i in no_trade]
+                    exclude_tickers = self.cfg['order_configs']['exclude_tickers']
+                    if len(exclude_tickers):
+                        no_trade = [i.strip() for i in exclude_tickers.split(',')]
                         if order['Symbol'].split("_")[0] in no_trade:
                             str_msg = f"BTO not accepted by config options: exclude_tickers = {no_trade}"
                             print(Back.GREEN + str_msg)
                             self.queue_prints.put([str_msg, "", "green"])
                             return "no", order, False
-                    
+
                     price = order['price']
                     if price == 0:
                         str_msg = f"Order not accepted price is 0"
                         print(Back.GREEN + str_msg)
                         self.queue_prints.put([str_msg, "", "red"])
                         return "no", order, False
-                    price = price*100 if order["asset"] == "option" else price
+                    price = price * 100 if order["asset"] == "option" else price
 
-                    max_trade_vals = eval(self.cfg["order_configs"]["max_trade_capital"])
-                    max_trade_val = float(max_trade_vals.get(order["Trader"], max_trade_vals["default"]))
-                    default_bto_qtys = eval(self.cfg["order_configs"]["default_bto_qty"])
-                    default_bto_qty = default_bto_qtys.get(order["Trader"], default_bto_qtys["default"])
-                    trade_capitals = eval(self.cfg["order_configs"]["trade_capital"])
-                    trade_capital = float(trade_capitals.get(order["Trader"], trade_capitals["default"]))
-                    
+                    max_trade_vals = ConfigValues.parse_dict(self.cfg["order_configs"]["max_trade_capital"])
+                    max_trade_val = float(
+                        max_trade_vals.get(order["Trader"], max_trade_vals.get("default", 1000))
+                        if isinstance(max_trade_vals, dict) else 1000
+                    )
+
+                    default_bto_qtys = ConfigValues.parse_dict(self.cfg["order_configs"]["default_bto_qty"])
+                    default_bto_qty = (
+                        default_bto_qtys.get(order["Trader"], default_bto_qtys.get("default", "buy_one"))
+                        if isinstance(default_bto_qtys, dict) else "buy_one"
+                    )
+
+                    trade_capitals = ConfigValues.parse_dict(self.cfg["order_configs"]["trade_capital"])
+                    trade_capital = float(
+                        trade_capitals.get(order["Trader"], trade_capitals.get("default", 300))
+                        if isinstance(trade_capitals, dict) else 300
+                    )
+
                     if 'Qty' not in order.keys() or order['Qty'] is None:
                         if default_bto_qty == "buy_one":
-                            order['Qty'] = 1                    
+                            order['Qty'] = 1
                         elif default_bto_qty == "trade_capital":
-                            order['Qty'] =  int(max(round(trade_capital/price), 1))
-                    # elif self.cfg['order_configs']['default_bto_qty'] == "trade_capital":
-                    #     order['Qty'] =  int(max(round(float(self.cfg['order_configs']['trade_capital'])/price), 1))
-                    
-                    
+                            order['Qty'] = int(max(round(trade_capital / price), 1))
+
                     if price * order['Qty'] > max_trade_val:
                         Qty_ori = order['Qty']
-                        order['Qty'] =  int(max(max_trade_val//price, 1))
+                        order['Qty'] = int(max(max_trade_val // price, 1))
                         if price * order['Qty'] <= max_trade_val:
-                            str_msg = f"BTO trade exeeded max_trade_capital of ${max_trade_val}, order quantity reduced to {order['Qty']} from {Qty_ori}"
+                            str_msg = f"BTO trade exceeded max_trade_capital of ${max_trade_val}, order quantity reduced to {order['Qty']} from {Qty_ori}"
                             print(Back.GREEN + str_msg)
                             self.queue_prints.put([str_msg, "", "green"])
                             order['trader_qty'] = Qty_ori
                         else:
-                            str_msg = f"cancelled BTO: trade exeeded max_trade_capital of ${max_trade_val}"
+                            str_msg = f"cancelled BTO: trade exceeded max_trade_capital of ${max_trade_val}"
                             print(Back.RED + str_msg)
                             self.queue_prints.put([str_msg, "", "red"])
                             return "no", order, False
                 return "yes", order, False
 
-            # Manual trade 
-            resp = input(Back.RED  + question + "\n Make trade? (y, n or (c)hange) \n").lower()
+            # Manual trade
+            resp = input(Back.RED + question + "\n Make trade? (y, n or (c)hange) \n").lower()
 
-            if resp in [ "c", "change", "y", "yes"] and 'Qty' not in order.keys():
+            if resp in ["c", "change", "y", "yes"] and 'Qty' not in order.keys():
                 order['Qty'] = int(input("Order qty not available." +
                                           f" How many units to buy? {price_now(symb, act)} \n"))
 
-            if resp in [ "c", "change"]:
+            if resp in ["c", "change"]:
                 new_order = order.copy()
                 new_order['price'] = float(input(f"Change price @{order['price']}" +
                                         f" {price_now(symb, act)}? Leave blank if NO \n")
                                       or order['price'])
 
                 if order['action'] == 'BTO':
-                    PTs = [order[f'PT{i}'] for i in range(1,self.max_stc_orders)]
-                    PTs = eval(input(f"Change PTs @{PTs} {price_now(symb, act)}? \
+                    PTs = [order[f'PT{i}'] for i in range(1, self.max_stc_orders)]
+                    pt_input = input(f"Change PTs @{PTs} {price_now(symb, act)}? \
                                       Leave blank if NO, respond eg [1, 2, None] \n")
-                                      or str(PTs))
+                    if pt_input.strip():
+                        try:
+                            PTs = safe_json_eval(pt_input)
+                        except (json.JSONDecodeError, ValueError):
+                            PTs = PTs
 
-                    new_n = len([i for i in PTs if i is not None ])
+                    new_n = len([i for i in PTs if i is not None])
                     if new_n != order['n_PTs']:
-                        new_order['n_PTs']= new_n
-                        new_order['PTs_Qty'] = [round(1/new_n,2) for i in range(new_n)]
-                        new_order['PTs_Qty'][-1] = new_order['PTs_Qty'][-1] + (1- sum(new_order['PTs_Qty']))
+                        new_order['n_PTs'] = new_n
+                        new_order['PTs_Qty'] = [round(1 / new_n, 2) for i in range(new_n)]
+                        new_order['PTs_Qty'][-1] = new_order['PTs_Qty'][-1] + (1 - sum(new_order['PTs_Qty']))
 
-                    new_order["SL"] = (input(f"Change SL @{order['SL']} {price_now(symb, act)}?"+
-                                             " Leave blank if NO \n")
-                                       or order['SL'])
+                    sl_input = input(f"Change SL @{order['SL']} {price_now(symb, act)}?" +
+                                             " Leave blank if NO \n") or order['SL']
 
-                    new_order["SL"] = eval(new_order["SL"]) if isinstance(new_order["SL"], str) else new_order["SL"]
+                    if isinstance(sl_input, str):
+                        try:
+                            sl_input = safe_eval(sl_input)
+                        except Exception:
+                            pass
+                    new_order["SL"] = sl_input
                 order = new_order
                 pars = self.order_to_pars(order)
-            else :
+            else:
                 break
         ord_chngd = ord_ori != order
         return resp, order, ord_chngd
@@ -616,8 +745,8 @@ class AlertsTrader():
                 # Cancel orders previous plan if any
                 self.close_open_exit_orders(open_trade)
                 
-            renew_plan = eval(old_plan)
-            if renew_plan is not None or renew_plan != {}:
+            renew_plan = safe_json_eval(old_plan) if isinstance(old_plan, str) else old_plan
+            if renew_plan is not None and renew_plan != {}:
                 for k in new_plan.keys():
                     renew_plan[k] = new_plan[k]
             else:
@@ -637,28 +766,30 @@ class AlertsTrader():
         elif order["action"] in ["BTO", "STO"] and not isOpen:
             alert_price = order["price"]
             action = order["action"]
-            
-            # Get exit plan and add default vals if needed
+
             exit_plan = parse_exit_plan(order)
             if action == "BTO":
-                if len(self.cfg["order_configs"]["default_exits"]) and \
+                default_exits_str = self.cfg["order_configs"]["default_exits"]
+                if len(default_exits_str) and \
                     exit_plan.get("PT1") is None and exit_plan.get("SL") is None:
-                    exit_plan = eval(self.cfg["order_configs"]["default_exits"])
-            # Do BTO TrailingStop
-            if order.get('open_trailingstop'): 
-                # get TS value, convet from percentage if needed
-                ts = order.get('open_trailingstop').replace("invTSbuy ", "").replace("TSbuy ", "")                
+                    exit_plan = safe_json_eval(default_exits_str)
+
+            if order.get('open_trailingstop'):
+                ts = order.get('open_trailingstop').replace("invTSbuy ", "").replace("TSbuy ", "")
                 if isinstance(ts, str) and "%" in ts:
-                    pricenow = self.price_now(order['Symbol'], 'BTO', 1 )
-                    ts = round((float(ts.split("%")[0])/100)*pricenow,2)
+                    pricenow = self.price_now(order['Symbol'], 'BTO', 1)
+                    ts = round((float(ts.split("%")[0]) / 100) * pricenow, 2)
                 elif isinstance(ts, str):
-                    ts = eval(ts) 
-                    if ts/order['price']>10 :  # must be error, diff too big, make it %
-                        str_msg = f"Trailing stop too high ({ts/order['price']} diff), must be in %, converted to {ts/100}%" 
+                    try:
+                        ts = safe_eval(ts)
+                    except Exception:
+                        ts = float(ts) if ts else 0
+                    if ts and order['price'] and ts / order['price'] > 10:
+                        str_msg = f"Trailing stop too high ({ts / order['price']} diff), must be in %, converted to {ts / 100}%"
                         print(Back.RED + str_msg)
                         self.queue_prints.put([str_msg, "", "red"])
-                        pricenow = self.price_now(order['Symbol'], 'BTO', 1 )
-                        ts = round((ts/100)*pricenow,2) 
+                        pricenow = self.price_now(order['Symbol'], 'BTO', 1)
+                        ts = round((ts / 100) * pricenow, 2) 
 
                 ts_order = order.get('open_trailingstop')
                 if ts_order.startswith("invTSbuy"):
@@ -971,7 +1102,7 @@ class AlertsTrader():
             
             # Set STC as exit plan, not bought yet
             elif qty_bought == 0:
-                exit_plan = eval(self.portfolio.loc[open_trade, "exit_plan"])
+                exit_plan = self._parse_exit_plan(self.portfolio.loc[open_trade, "exit_plan"])
                 exit_plan[f"PT{STC[-1]}"] = order["price"]
                 self.portfolio.loc[open_trade, "exit_plan"] = str(exit_plan)
                 str_msg = f"Exit Plan {order['Symbol']} updated, with PT{STC[-1]}: {order['price']}"
@@ -1144,58 +1275,57 @@ class AlertsTrader():
         self.save_logs()
 
 
-    def exit_percent_to_price(self, open_trade):
+    def exit_percent_to_price(self, open_trade: int) -> None:
+        """Convert percentage exits to actual prices."""
         trade = self.portfolio.loc[open_trade]
         if trade["BTO-Status"] not in ["FILLED", "EXECUTED"]:
             return
-        
+
         price = trade["Price"]
-        exit_plan = eval(self.portfolio.loc[open_trade, "exit_plan"])
+        exit_plan = self._parse_exit_plan(self.portfolio.loc[open_trade, "exit_plan"])
         exit_plan_o = exit_plan.copy()
 
-        for exit in [f"PT{i}" for i in range(1,self.max_stc_orders)]:
-            if exit_plan.get(exit) is None or not isinstance(exit_plan[exit], str)  or "%" not in exit_plan[exit]:
+        for exit_key in [f"PT{i}" for i in range(1, self.max_stc_orders)]:
+            if exit_plan.get(exit_key) is None or not isinstance(exit_plan[exit_key], str) or "%" not in exit_plan[exit_key]:
                 continue
-            
-            if "TS" in exit_plan[exit]: 
-                pt,ts = exit_plan[exit].split("TS")
-                if "%" in pt:  # format val%TSval%
+
+            if "TS" in str(exit_plan[exit_key]):
+                pt, ts = str(exit_plan[exit_key]).split("TS")
+                if "%" in pt:
                     if trade["Type"] == "STO":
-                        print("\033[91mWARNING: TrailingStop in buy to close. Why? \033[0m")
-                        if "%" in pt:
-                            ptv = round(price * (1 - float(pt.replace("%", ""))/100),2)
+                        ptv = round(price * (1 - float(pt.replace("%", "")) / 100), 2)
                     else:
-                        ptv = round(price * (1 + float(pt.replace("%", ""))/100),2)
-                else: # format valTSval%
-                    ptv = float(pt)
-                if "%" in ts: # format TSval%
-                    ts =  round(price * (float(ts.replace("%", ""))/100) ,2)
-                else: # format TSval
-                    ts = float(ts)
-                exit_plan[exit] = f"{ptv}TS{ts}"
-            else: # format val%                
-                if "%" in exit_plan[exit]:
-                    if trade["Type"] == "STO":
-                        ptv = round(price * (1 - float(exit_plan[exit].replace("%", ""))/100),2)
-                    else:
-                        ptv = round(price * (1 + float(exit_plan[exit].replace("%", ""))/100),2)
+                        ptv = round(price * (1 + float(pt.replace("%", "")) / 100), 2)
                 else:
-                    ptv = float(exit_plan[exit])
-                exit_plan[exit] = ptv
-        
-        sl = exit_plan["SL"]
+                    ptv = float(pt) if pt else price
+                if "%" in ts:
+                    ts = round(price * (float(ts.replace("%", "")) / 100), 2)
+                else:
+                    ts = float(ts) if ts else 0
+                exit_plan[exit_key] = f"{ptv}TS{ts}"
+            else:
+                if "%" in str(exit_plan[exit_key]):
+                    if trade["Type"] == "STO":
+                        ptv = round(price * (1 - float(str(exit_plan[exit_key]).replace("%", "")) / 100), 2)
+                    else:
+                        ptv = round(price * (1 + float(str(exit_plan[exit_key]).replace("%", "")) / 100), 2)
+                else:
+                    ptv = float(exit_plan[exit_key]) if exit_plan[exit_key] else price
+                exit_plan[exit_key] = ptv
+
+        sl = exit_plan.get("SL")
         if sl is not None and isinstance(sl, str) and "%" in sl:
-            if "TS" in sl:  # format TSval%
-                sl = round(price * (float(sl.replace("%", "").replace("TS", ""))/100),2)
-                exit_plan["SL"] = f"TS{sl}"
-            else: # format val%
+            if "TS" in sl:
+                sl_val = round(price * (float(sl.replace("%", "").replace("TS", "")) / 100), 2)
+                exit_plan["SL"] = f"TS{sl_val}"
+            else:
                 if trade["Type"] == "STO":
-                    exit_plan["SL"] = round(price * (1 + float(sl.replace("%", ""))/100),2)
+                    exit_plan["SL"] = round(price * (1 + float(sl.replace("%", "")) / 100), 2)
                 else:
-                    exit_plan["SL"] = round(price * (1 - float(sl.replace("%", ""))/100),2)
-                
+                    exit_plan["SL"] = round(price * (1 - float(sl.replace("%", "")) / 100), 2)
+
         self.portfolio.loc[open_trade, "exit_plan"] = str(exit_plan)
-        
+
         if exit_plan_o != exit_plan:
             str_msg = f"Updated exits for from % to value, from:{exit_plan_o}, to:{exit_plan}"
             print(Back.GREEN + str_msg)
@@ -1215,10 +1345,10 @@ class AlertsTrader():
             
             # check if inverse TSbuy stop has reached or update stop
             if trade["BTO-Status"] == "invTSbuy":
-                self.order_update_rate = 1       
+                self.order_update_rate = 1
                 ts_const, max_price = trade["open_trailingstop"].split(",")
-                max_price = eval(max_price.split(":")[1])
-                ts_const = eval(ts_const.split(":")[1])
+                max_price = self._parse_trailing_value(max_price.split(":")[1])
+                ts_const = self._parse_trailing_value(ts_const.split(":")[1])
                 stp_price = max_price - ts_const
                 quote_opt = self.price_now(trade['Symbol'], "STC", 1)
                 if quote_opt == -1:
@@ -1303,7 +1433,7 @@ class AlertsTrader():
                     
                     # Add default short exits, once filled and price is known
                     if self.portfolio.loc[i, "Type"] == "STO":
-                        exit_plan = eval(self.portfolio.loc[i,"exit_plan"])
+                        exit_plan = self._parse_exit_plan(self.portfolio.loc[i, "exit_plan"])
                         if len(self.cfg['shorting']['BTC_PT']) and exit_plan.get("PT1") is None:
                             exit_plan['PT1'] = round(price * (1 - float(self.cfg['shorting']['BTC_PT'])/100),2)
                         if len(self.cfg['shorting']['BTC_SL']) and exit_plan.get("SL") is None:
@@ -1388,9 +1518,10 @@ class AlertsTrader():
                 # Change exits before 15 min to close
                 if time_now >= time_quarter.time() and time_now < time_five.time() and \
                     len(self.cfg['shorting']['BTC_EOD_PT_SL']):
-                        exit_plan = eval(trade["exit_plan"])                        
+                        exit_plan = self._parse_exit_plan(trade["exit_plan"])
                         PT, SL = self.cfg['shorting']['BTC_EOD_PT_SL'].split(",")
-                        SL, PT = eval(SL)/100, eval(PT)/100
+                        PT = safe_eval(PT) / 100
+                        SL = safe_eval(SL) / 100
                         
                         if self.EOD.get(trade["Symbol"]) != "15min":
                             # Close and send lim order
@@ -1442,16 +1573,16 @@ class AlertsTrader():
             if self.update_paused:
                 return
             if trade['Type'] == 'STO' and (cfg['shorting']['avg_down'] is not None or
-                                           (not pd.isna(trade.get('avg_down')) and 
-                                           not pd.isna(eval(trade['avg_down']).get('avgs')))):
-                
+                                           (not pd.isna(trade.get('avg_down')) and
+                                           not pd.isna(self._parse_avg_down(trade['avg_down']).get('avgs')))):
+
                 price_currernt = self.price_now(trade['Symbol'], "STO", 1)
                 avg_down = {}
                 if not pd.isna(trade.get('avg_down')):
-                    avg_down = eval(trade['avg_down'])
-                    
-                avg_down_list = eval(cfg['shorting']['avg_down'])
-                if not pd.isna(avg_down.get('avgs')):                    
+                    avg_down = self._parse_avg_down(trade['avg_down'])
+
+                avg_down_list = self._parse_avg_down(cfg['shorting']['avg_down'])
+                if not pd.isna(avg_down.get('avgs')):
                     avg_down_list = avg_down.get('avgs')
                 
                 for avg in avg_down_list:
@@ -1529,7 +1660,7 @@ class AlertsTrader():
                 self.close_open_exit_orders(i)
             self.exit_percent_to_price(i)
             trade = self.portfolio.iloc[i]
-            exit_plan = eval(trade["exit_plan"])
+            exit_plan = self._parse_exit_plan(trade["exit_plan"])
             if exit_plan != {}:                
                 self.make_exit_orders(i, exit_plan)
                 self.exit_percent_to_price(i)
@@ -1635,7 +1766,7 @@ class AlertsTrader():
                 if isinstance(exit_plan[f"PT{ii}"], str) and "TS" in exit_plan[f"PT{ii}"]:
                     self.order_update_rate = 1
                     trigger = float(exit_plan[f"PT{ii}"].split("TS")[0])
-                    TS = eval(exit_plan[f"PT{ii}"].split("TS")[1])
+                    TS = self._parse_trailing_value(exit_plan[f"PT{ii}"].split("TS")[1])
                     quote_opt = self.price_now(trade['Symbol'], "STC", 1)
                     if quote_opt >= trigger:
                         self.close_open_exit_orders(open_trade)
